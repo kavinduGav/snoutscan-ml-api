@@ -11,7 +11,7 @@ from models.embedding import load_embedding_model, generate_embedding, average_e
 # FLAGS
 # flip to True once snoutscan_backbone.pt is trained
 # =====================
-EMBEDDING_MODEL_READY = False
+EMBEDDING_MODEL_READY = True
 
 # =====================
 # LOAD MODELS AT STARTUP
