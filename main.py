@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pillow_heif import register_heif_opener
 
 from models.classifier import classify, load_classifier
 from models.embedding import average_embeddings, generate_embedding, load_embedding_model
@@ -45,6 +46,8 @@ async def lifespan(app: FastAPI):
 # =====================
 # APP
 # =====================
+register_heif_opener()
+
 app = FastAPI(
     title='SnoutScan ML API',
     description='Dog noseprint quality classifier + embedding generator',
@@ -59,7 +62,8 @@ app.add_middleware(
     allow_headers=['*'],
 )
 
-ALLOWED_TYPES = {'image/jpeg', 'image/png', 'image/webp'}
+ALLOWED_TYPES = {'image/jpeg', 'image/png', 'image/webp', 'image/heif', 'image/heic'}
+MAX_FILE_BYTES = 10 * 1024 * 1024
 REGISTRY_FILE = Path('data/registered_dogs.json')
 
 
@@ -90,6 +94,46 @@ def _find_name_index(records: list, name: str) -> int:
     return -1
 
 
+def _validate_upload(file: UploadFile, image_bytes: bytes) -> None:
+    if file.content_type not in ALLOWED_TYPES:
+        raise HTTPException(status_code=400, detail=f'Invalid file type: {file.content_type}')
+
+    if len(image_bytes) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=400, detail='File too large - max 10MB')
+
+
+def _enforce_quality(image_bytes: bytes, image_label: str) -> None:
+    try:
+        quality = classify(ml_models['classifier'], image_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Quality classification failed: {str(e)}')
+
+    if not quality.get('accepted', False):
+        quality_class = quality.get('class', 'unknown')
+        reason = 'quality_failed'
+        message = f'{image_label} failed quality validation'
+        guidance = 'Retake the image with clear focus and centered noseprint.'
+
+        if quality_class == 'not_noseprint':
+            reason = 'not_dog_nose_image'
+            message = f'{image_label} is not recognized as a dog nose image'
+            guidance = "Capture your dog's nose directly and fill most of the frame."
+        elif quality_class == 'wrong_noseprint_blurry':
+            reason = 'low_quality_nose_image'
+            message = f'{image_label} is a dog nose image but quality is too low'
+            guidance = 'Retake in good light and hold steady to avoid blur.'
+
+        raise HTTPException(
+            status_code=422,
+            detail={
+                'error_type': reason,
+                'message': message,
+                'guidance': guidance,
+                'quality': quality,
+            },
+        )
+
+
 # =====================
 # ROUTES
 # =====================
@@ -113,13 +157,8 @@ def health():
 # =====================
 @app.post('/classify')
 async def classify_image(file: UploadFile = File(...)):
-    if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(status_code=400, detail=f'Invalid file type: {file.content_type}')
-
     image_bytes = await file.read()
-
-    if len(image_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail='File too large - max 10MB')
+    _validate_upload(file, image_bytes)
 
     try:
         return classify(ml_models['classifier'], image_bytes)
@@ -135,10 +174,9 @@ async def embed_image(file: UploadFile = File(...)):
     if not EMBEDDING_MODEL_READY or ml_models['embedding'] is None:
         raise HTTPException(status_code=503, detail='Embedding model not ready yet')
 
-    if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(status_code=400, detail=f'Invalid file type: {file.content_type}')
-
     image_bytes = await file.read()
+    _validate_upload(file, image_bytes)
+    _enforce_quality(image_bytes, 'Image')
 
     try:
         embedding = generate_embedding(ml_models['embedding'], image_bytes)
@@ -164,6 +202,11 @@ async def register_dog(
 
     bytes1 = await image1.read()
     bytes2 = await image2.read()
+
+    _validate_upload(image1, bytes1)
+    _validate_upload(image2, bytes2)
+    _enforce_quality(bytes1, 'image1')
+    _enforce_quality(bytes2, 'image2')
 
     try:
         emb1 = generate_embedding(ml_models['embedding'], bytes1)
@@ -204,9 +247,6 @@ async def identify_dog(
     if not EMBEDDING_MODEL_READY or ml_models['embedding'] is None:
         raise HTTPException(status_code=503, detail='Embedding model not ready yet')
 
-    if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(status_code=400, detail=f'Invalid file type: {file.content_type}')
-
     if not 0.0 <= threshold <= 1.0:
         raise HTTPException(status_code=400, detail='Threshold must be between 0 and 1')
 
@@ -220,6 +260,8 @@ async def identify_dog(
         raise HTTPException(status_code=404, detail='No registered dogs found')
 
     image_bytes = await file.read()
+    _validate_upload(file, image_bytes)
+    _enforce_quality(image_bytes, 'Image')
 
     try:
         probe = np.array(generate_embedding(ml_models['embedding'], image_bytes), dtype=np.float32)
