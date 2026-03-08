@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
-from torchvision.models import EfficientNet_B0_Weights
 from PIL import Image
 import io
 
@@ -31,7 +30,7 @@ transform = transforms.Compose([
 # LOAD
 # =====================
 def load_classifier(model_path: str = 'weights/snoutscan_quality.pt'):
-    model = models.efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
+    model = models.efficientnet_b0(weights=None)
     model.classifier = nn.Sequential(
         nn.Dropout(p=0.3),
         nn.Linear(model.classifier[1].in_features, 3)

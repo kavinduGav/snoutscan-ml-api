@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models, transforms
-from torchvision.models import ResNet50_Weights
 from PIL import Image
 import io
 import numpy as np
@@ -50,7 +49,7 @@ transform = transforms.Compose([
 class NoseEmbeddingModel(nn.Module):
     def __init__(self, embedding_dim=EMBEDDING_DIM):
         super().__init__()
-        backbone        = models.resnet50(weights=ResNet50_Weights.DEFAULT)
+        backbone        = models.resnet50(weights=None)
         self.backbone   = nn.Sequential(*list(backbone.children())[:-1])
         self.embedding_head = nn.Sequential(
             nn.Flatten(),
