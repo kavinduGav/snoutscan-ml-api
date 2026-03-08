@@ -6,6 +6,7 @@ import json
 import mimetypes
 from pathlib import Path
 from contextlib import asynccontextmanager
+from threading import Lock, Thread
 from typing import Optional, Tuple
 
 import httpx
@@ -27,22 +28,66 @@ EMBEDDING_MODEL_READY = True
 # =====================
 # LOAD MODELS AT STARTUP
 # =====================
-ml_models = {}
+ml_models = {
+    'classifier': None,
+    'embedding': None,
+}
+models_lock = Lock()
+models_loaded = False
+models_load_error: Optional[str] = None
+
+
+def _load_models_once() -> None:
+    global models_loaded, models_load_error
+
+    if models_loaded:
+        return
+
+    with models_lock:
+        if models_loaded:
+            return
+
+        try:
+            print('Loading models...')
+            ml_models['classifier'] = load_classifier('weights/snoutscan_quality.pt')
+
+            if EMBEDDING_MODEL_READY:
+                ml_models['embedding'] = load_embedding_model('weights/snoutscan_backbone.pt')
+            else:
+                ml_models['embedding'] = None
+                print('  Embedding model not ready - /embed and /register disabled')
+
+            models_loaded = True
+            models_load_error = None
+            print('Models ready')
+        except Exception as e:
+            models_load_error = str(e)
+            raise
+
+
+def _warmup_models_background() -> None:
+    try:
+        _load_models_once()
+    except Exception as e:
+        print(f'Model warmup failed: {e}')
+
+
+def _ensure_models_loaded() -> None:
+    if models_loaded:
+        return
+
+    try:
+        _load_models_once()
+    except Exception:
+        detail = models_load_error or 'Model loading failed'
+        raise HTTPException(status_code=500, detail=detail)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print('Loading models...')
-
-    ml_models['classifier'] = load_classifier('weights/snoutscan_quality.pt')
-
-    if EMBEDDING_MODEL_READY:
-        ml_models['embedding'] = load_embedding_model('weights/snoutscan_backbone.pt')
-    else:
-        ml_models['embedding'] = None
-        print('  Embedding model not ready - /embed and /register disabled')
-
-    print('API ready')
+    print('API starting...')
+    Thread(target=_warmup_models_background, daemon=True).start()
+    print('API ready (model warmup in background)')
     yield
     ml_models.clear()
 
@@ -146,6 +191,8 @@ async def _download_image_from_url(url: str) -> Tuple[bytes, Optional[str]]:
 
 
 def _require_embedding_ready() -> None:
+    _ensure_models_loaded()
+
     if not EMBEDDING_MODEL_READY or ml_models['embedding'] is None:
         raise HTTPException(status_code=503, detail='Embedding model not ready yet')
 
@@ -207,11 +254,18 @@ def health():
     return {'status': 'ok'}
 
 
+@app.get('/kaithheathcheck')
+def leapcell_healthcheck():
+    return {'status': 'ok'}
+
+
 # =====================
 # CLASSIFY
 # =====================
 @app.post('/classify')
 async def classify_image(file: UploadFile = File(...)):
+    _ensure_models_loaded()
+
     image_bytes = await file.read()
     _validate_upload(file, image_bytes)
 
