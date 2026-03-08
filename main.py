@@ -261,6 +261,11 @@ def leapcell_healthcheck():
     return {'status': 'ok'}
 
 
+@app.get('/kaithhealthcheck')
+def leapcell_healthcheck_alias():
+    return {'status': 'ok'}
+
+
 # =====================
 # CLASSIFY
 # =====================
