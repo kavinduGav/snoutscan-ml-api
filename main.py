@@ -3,12 +3,16 @@ os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 
 import json
+import mimetypes
 from pathlib import Path
 from contextlib import asynccontextmanager
+from typing import Optional, Tuple
 
+import httpx
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from pillow_heif import register_heif_opener
 
 from models.classifier import classify, load_classifier
@@ -67,6 +71,18 @@ MAX_FILE_BYTES = 10 * 1024 * 1024
 REGISTRY_FILE = Path('data/registered_dogs.json')
 
 
+class UrlImageItem(BaseModel):
+    imageUrl: str
+
+
+class RegisterFromUrlsRequest(BaseModel):
+    images: list[UrlImageItem]
+
+
+class SingleImageUrlRequest(BaseModel):
+    imageUrl: str
+
+
 def _load_registry() -> dict:
     if not REGISTRY_FILE.exists():
         return {'dogs': []}
@@ -95,11 +111,50 @@ def _find_name_index(records: list, name: str) -> int:
 
 
 def _validate_upload(file: UploadFile, image_bytes: bytes) -> None:
-    if file.content_type not in ALLOWED_TYPES:
+    content_type = (file.content_type or '').split(';')[0].strip().lower()
+
+    if content_type not in ALLOWED_TYPES:
         raise HTTPException(status_code=400, detail=f'Invalid file type: {file.content_type}')
 
     if len(image_bytes) > MAX_FILE_BYTES:
         raise HTTPException(status_code=400, detail='File too large - max 10MB')
+
+
+def _validate_content_type_and_size(content_type: Optional[str], image_bytes: bytes) -> None:
+    normalized = (content_type or '').split(';')[0].strip().lower()
+
+    if normalized not in ALLOWED_TYPES:
+        raise HTTPException(status_code=400, detail=f'Invalid file type: {content_type}')
+
+    if len(image_bytes) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=400, detail='File too large - max 10MB')
+
+
+async def _download_image_from_url(url: str) -> Tuple[bytes, Optional[str]]:
+    guessed_type, _ = mimetypes.guess_type(url)
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            content_type = response.headers.get('content-type') or guessed_type
+            return response.content, content_type
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=400, detail=f'Failed to fetch image URL: {url} ({e.response.status_code})')
+    except httpx.RequestError:
+        raise HTTPException(status_code=400, detail=f'Failed to fetch image URL: {url}')
+
+
+def _require_embedding_ready() -> None:
+    if not EMBEDDING_MODEL_READY or ml_models['embedding'] is None:
+        raise HTTPException(status_code=503, detail='Embedding model not ready yet')
+
+
+def _build_embedding(image_bytes: bytes) -> list[float]:
+    try:
+        return generate_embedding(ml_models['embedding'], image_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Embedding failed: {str(e)}')
 
 
 def _enforce_quality(image_bytes: bytes, image_label: str) -> None:
@@ -171,18 +226,90 @@ async def classify_image(file: UploadFile = File(...)):
 # =====================
 @app.post('/embed')
 async def embed_image(file: UploadFile = File(...)):
-    if not EMBEDDING_MODEL_READY or ml_models['embedding'] is None:
-        raise HTTPException(status_code=503, detail='Embedding model not ready yet')
+    _require_embedding_ready()
 
     image_bytes = await file.read()
     _validate_upload(file, image_bytes)
     _enforce_quality(image_bytes, 'Image')
 
-    try:
-        embedding = generate_embedding(ml_models['embedding'], image_bytes)
-        return {'embedding': embedding, 'dimensions': len(embedding)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f'Embedding failed: {str(e)}')
+    embedding = _build_embedding(image_bytes)
+    return {'embedding': embedding, 'dimensions': len(embedding)}
+
+
+@app.post('/biometric/probe-embedding')
+async def probe_embedding(file: UploadFile = File(...)):
+    _require_embedding_ready()
+
+    image_bytes = await file.read()
+    _validate_upload(file, image_bytes)
+    _enforce_quality(image_bytes, 'Image')
+
+    embedding = _build_embedding(image_bytes)
+    return {'embedding': embedding, 'dimensions': len(embedding)}
+
+
+@app.post('/biometric/probe-embedding-from-url')
+async def probe_embedding_from_url(payload: SingleImageUrlRequest):
+    _require_embedding_ready()
+
+    image_bytes, content_type = await _download_image_from_url(payload.imageUrl)
+    _validate_content_type_and_size(content_type, image_bytes)
+    _enforce_quality(image_bytes, 'Image')
+
+    embedding = _build_embedding(image_bytes)
+    return {'embedding': embedding, 'dimensions': len(embedding)}
+
+
+@app.post('/biometric/register-embedding')
+async def register_embedding(
+    image1: UploadFile = File(...),
+    image2: UploadFile = File(...),
+):
+    _require_embedding_ready()
+
+    bytes1 = await image1.read()
+    bytes2 = await image2.read()
+
+    _validate_upload(image1, bytes1)
+    _validate_upload(image2, bytes2)
+    _enforce_quality(bytes1, 'image1')
+    _enforce_quality(bytes2, 'image2')
+
+    emb1 = _build_embedding(bytes1)
+    emb2 = _build_embedding(bytes2)
+    avg = average_embeddings(emb1, emb2)
+
+    return {
+        'embedding': avg,
+        'dimensions': len(avg),
+        'images_used': 2,
+    }
+
+
+@app.post('/biometric/register-embedding-from-urls')
+async def register_embedding_from_urls(payload: RegisterFromUrlsRequest):
+    _require_embedding_ready()
+
+    if len(payload.images) != 2:
+        raise HTTPException(status_code=400, detail='Exactly 2 images are required')
+
+    bytes1, type1 = await _download_image_from_url(payload.images[0].imageUrl)
+    bytes2, type2 = await _download_image_from_url(payload.images[1].imageUrl)
+
+    _validate_content_type_and_size(type1, bytes1)
+    _validate_content_type_and_size(type2, bytes2)
+    _enforce_quality(bytes1, 'image1')
+    _enforce_quality(bytes2, 'image2')
+
+    emb1 = _build_embedding(bytes1)
+    emb2 = _build_embedding(bytes2)
+    avg = average_embeddings(emb1, emb2)
+
+    return {
+        'embedding': avg,
+        'dimensions': len(avg),
+        'images_used': 2,
+    }
 
 
 # =====================
