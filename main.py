@@ -16,9 +16,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pillow_heif import register_heif_opener
 
-from models.classifier import classify, load_classifier
-from models.embedding import average_embeddings, generate_embedding, load_embedding_model
-
 # =====================
 # FLAGS
 # flip to True once snoutscan_backbone.pt is trained
@@ -49,6 +46,9 @@ def _load_models_once() -> None:
 
         try:
             print('Loading models...')
+            from models.classifier import load_classifier
+            from models.embedding import load_embedding_model
+
             ml_models['classifier'] = load_classifier('weights/snoutscan_quality.pt')
 
             if EMBEDDING_MODEL_READY:
@@ -199,6 +199,7 @@ def _require_embedding_ready() -> None:
 
 def _build_embedding(image_bytes: bytes) -> list[float]:
     try:
+        from models.embedding import generate_embedding
         return generate_embedding(ml_models['embedding'], image_bytes)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'Embedding failed: {str(e)}')
@@ -206,6 +207,7 @@ def _build_embedding(image_bytes: bytes) -> list[float]:
 
 def _enforce_quality(image_bytes: bytes, image_label: str) -> None:
     try:
+        from models.classifier import classify
         quality = classify(ml_models['classifier'], image_bytes)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'Quality classification failed: {str(e)}')
@@ -329,6 +331,8 @@ async def register_embedding(
     _enforce_quality(bytes1, 'image1')
     _enforce_quality(bytes2, 'image2')
 
+    from models.embedding import average_embeddings
+
     emb1 = _build_embedding(bytes1)
     emb2 = _build_embedding(bytes2)
     avg = average_embeddings(emb1, emb2)
@@ -354,6 +358,8 @@ async def register_embedding_from_urls(payload: RegisterFromUrlsRequest):
     _validate_content_type_and_size(type2, bytes2)
     _enforce_quality(bytes1, 'image1')
     _enforce_quality(bytes2, 'image2')
+
+    from models.embedding import average_embeddings
 
     emb1 = _build_embedding(bytes1)
     emb2 = _build_embedding(bytes2)
@@ -390,6 +396,8 @@ async def register_dog(
     _enforce_quality(bytes2, 'image2')
 
     try:
+        from models.embedding import average_embeddings, generate_embedding
+
         emb1 = generate_embedding(ml_models['embedding'], bytes1)
         emb2 = generate_embedding(ml_models['embedding'], bytes2)
         avg = average_embeddings(emb1, emb2)
