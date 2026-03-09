@@ -272,6 +272,7 @@ def leapcell_healthcheck_alias():
 @app.post('/classify')
 async def classify_image(file: UploadFile = File(...)):
     _ensure_models_loaded()
+    from models.classifier import classify
 
     image_bytes = await file.read()
     _validate_upload(file, image_bytes)
